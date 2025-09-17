@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<users>
+  <user>
+    <email>admin@chat.com</email>
+    <password>240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9</password>
+    <name>Administrator</name>
+    <isAdmin>true</isAdmin>
+    <created>2025-09-17 18:51:42</created>
+  </user>
+</users>
