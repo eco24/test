@@ -1,45 +1,27 @@
 package client.Admin.model;
 
-import java.io.*;
-import java.net.*;
+import client.Admin.model.network.AdminNetworkManager;
+import client.Admin.model.network.MessageProcessor;
+import client.Admin.model.network.XmlMessageBuilder;
+import client.Admin.model.data.AdminSession;
+import client.Admin.model.data.DataCache;
 import java.util.*;
-import javax.xml.parsers.*;
-import org.w3c.dom.*;
-import org.xml.sax.InputSource;
 
 /**
- * Admin Client Model - Handles business logic and server communication
- * Fixed version with improved error handling and connection management
+ * Admin Client Model - Handles business logic and coordinates components
+ * Refactored to use composition and separation of concerns
  */
-public class AdminModel {
+public class AdminModel implements AdminNetworkManager.NetworkListener {
 
-    // Server connection details
-    private static final String SERVER_HOST = "localhost";
-    private static final int SERVER_PORT = 9999;
-
-    // Connection components
-    private Socket socket;
-    private BufferedReader in;
-    private PrintWriter out;
-    private boolean connected;
-    private boolean authenticated;
-
-    // Admin information
-    private String adminEmail;
-    private String adminName;
-    private String sessionId;
-
-    // Data storage
-    private List<Map<String, String>> usersList;
-    private List<Map<String, String>> groupsList;
-    private List<String> messageLog;
-
-    // Message receiver thread
-    private Thread messageReceiverThread;
-    private boolean receiving;
+    // Core components
+    private final AdminNetworkManager networkManager;
+    private final MessageProcessor messageProcessor;
+    private final XmlMessageBuilder xmlBuilder;
+    private final AdminSession session;
+    private final DataCache dataCache;
 
     // Listeners
-    private List<ModelListener> listeners;
+    private final List<ModelListener> listeners;
 
     /**
      * Interface for model event listeners
@@ -58,12 +40,12 @@ public class AdminModel {
      * Constructor
      */
     public AdminModel() {
-        this.connected = false;
-        this.authenticated = false;
-        this.usersList = new ArrayList<>();
-        this.groupsList = new ArrayList<>();
-        this.messageLog = new ArrayList<>();
         this.listeners = new ArrayList<>();
+        this.session = new AdminSession();
+        this.dataCache = new DataCache();
+        this.xmlBuilder = new XmlMessageBuilder();
+        this.networkManager = new AdminNetworkManager(this);
+        this.messageProcessor = new MessageProcessor(session, dataCache, this);
     }
 
     // ==================== CONNECTION MANAGEMENT ====================
@@ -72,89 +54,29 @@ public class AdminModel {
      * Connects to the server
      */
     public boolean connect() {
-        try {
-            // Close existing connection if any
-            if (socket != null && !socket.isClosed()) {
-                disconnect();
-            }
-
-            logMessage("Attempting to connect to " + SERVER_HOST + ":" + SERVER_PORT);
-            socket = new Socket();
-            socket.connect(new InetSocketAddress(SERVER_HOST, SERVER_PORT), 5000); // 5 second timeout
-
-            in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            out = new PrintWriter(socket.getOutputStream(), true);
-
-            connected = true;
-            receiving = true;
-
-            // Start message receiver thread
-            startMessageReceiver();
-
-            notifyConnectionStatusChanged(true);
-            logMessage("Successfully connected to server");
-
-            return true;
-
-        } catch (IOException e) {
-            logMessage("Failed to connect to server: " + e.getMessage());
-            System.err.println("[ERROR] Connection failed: " + e.getMessage());
-            notifyConnectionStatusChanged(false);
-            return false;
-        }
+        return networkManager.connect();
     }
 
     /**
      * Disconnects from the server
      */
     public void disconnect() {
-        receiving = false;
-
-        if (authenticated) {
-            sendLogoutMessage();
-        }
-
-        connected = false;
-        authenticated = false;
-
-        // Close resources
-        try {
-            if (messageReceiverThread != null && messageReceiverThread.isAlive()) {
-                messageReceiverThread.interrupt();
-            }
-
-            if (in != null) {
-                in.close();
-                in = null;
-            }
-            if (out != null) {
-                out.close();
-                out = null;
-            }
-            if (socket != null && !socket.isClosed()) {
-                socket.close();
-                socket = null;
-            }
-        } catch (IOException e) {
-            System.err.println("[ERROR] Error during disconnect: " + e.getMessage());
-        }
-
-        notifyConnectionStatusChanged(false);
-        logMessage("Disconnected from server");
+        networkManager.disconnect();
+        session.clearSession();
     }
 
     /**
      * Checks if connected to server
      */
     public boolean isConnected() {
-        return connected && socket != null && !socket.isClosed();
+        return networkManager.isConnected();
     }
 
     /**
      * Checks if authenticated
      */
     public boolean isAuthenticated() {
-        return authenticated && connected;
+        return session.isAuthenticated() && networkManager.isConnected();
     }
 
     // ==================== AUTHENTICATION ====================
@@ -163,49 +85,38 @@ public class AdminModel {
      * Attempts to login as admin
      */
     public void login(String email, String password) {
-        logMessage("Starting login process for: " + email);
-
-        // Validate input
-        if (email == null || email.trim().isEmpty()) {
-            notifyLoginResult(false, "Email cannot be empty");
-            return;
-        }
-
-        if (password == null || password.trim().isEmpty()) {
-            notifyLoginResult(false, "Password cannot be empty");
+        if (!validateLoginInput(email, password)) {
             return;
         }
 
         // Connect if not already connected
-        if (!connected) {
-            if (!connect()) {
+        if (!networkManager.isConnected()) {
+            if (!networkManager.connect()) {
                 notifyLoginResult(false, "Failed to connect to server");
                 return;
             }
         }
 
-        // Store admin email
-        this.adminEmail = email.trim();
+        // Store admin email in session
+        session.setAdminEmail(email.trim());
 
         // Send login message
-        String loginXML = createLoginXML(email.trim(), password);
-        sendMessage(loginXML);
-        logMessage("Login request sent for: " + email);
+        String loginXML = xmlBuilder.createLoginMessage(email.trim(), password);
+        networkManager.sendMessage(loginXML);
+        addLogEntry("Login request sent for: " + email);
     }
 
     /**
      * Logs out from the server
      */
     public void logout() {
-        if (authenticated) {
-            sendLogoutMessage();
-            authenticated = false;
-            adminEmail = null;
-            adminName = null;
-            sessionId = null;
-            logMessage("Logged out successfully");
+        if (session.isAuthenticated()) {
+            String logoutXML = xmlBuilder.createLogoutMessage();
+            networkManager.sendMessage(logoutXML);
+            session.clearSession();
+            addLogEntry("Logged out successfully");
         }
-        disconnect();
+        networkManager.disconnect();
     }
 
     // ==================== USER MANAGEMENT ====================
@@ -214,75 +125,60 @@ public class AdminModel {
      * Requests all users from server
      */
     public void requestAllUsers() {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String requestXML = createRequestXML("admin_getusers");
-        sendMessage(requestXML);
-        logMessage("Requested users list");
+        String requestXML = xmlBuilder.createRequestMessage("admin_getusers");
+        networkManager.sendMessage(requestXML);
+        addLogEntry("Requested users list");
     }
 
     /**
      * Searches for users
      */
     public void searchUsers(String searchKey) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String searchXML = createSearchUsersXML(searchKey);
-        sendMessage(searchXML);
-        logMessage("Searching users for: " + searchKey);
+        String searchXML = xmlBuilder.createSearchUsersMessage(searchKey);
+        networkManager.sendMessage(searchXML);
+        addLogEntry("Searching users for: " + searchKey);
     }
 
     /**
      * Adds a new user
      */
     public void addUser(String email, String password, String name, boolean isAdmin) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String addUserXML = createAddUserXML(email, password, name, isAdmin);
-        sendMessage(addUserXML);
-        logMessage("Adding new user: " + email);
+        String addUserXML = xmlBuilder.createAddUserMessage(email, password, name, isAdmin);
+        networkManager.sendMessage(addUserXML);
+        addLogEntry("Adding new user: " + email);
     }
 
     /**
      * Updates user information
      */
     public void updateUser(String email, String newName, String newPassword) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String updateXML = createUpdateUserXML(email, newName, newPassword);
-        sendMessage(updateXML);
-        logMessage("Updating user: " + email);
+        String updateXML = xmlBuilder.createUpdateUserMessage(email, newName, newPassword);
+        networkManager.sendMessage(updateXML);
+        addLogEntry("Updating user: " + email);
     }
 
     /**
      * Deletes a user
      */
     public void deleteUser(String email) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
         if (email.equals("admin@chat.com")) {
             notifyError("Cannot delete the main admin account");
             return;
         }
 
-        String deleteXML = createDeleteUserXML(email);
-        sendMessage(deleteXML);
-        logMessage("Deleting user: " + email);
+        String deleteXML = xmlBuilder.createDeleteUserMessage(email);
+        networkManager.sendMessage(deleteXML);
+        addLogEntry("Deleting user: " + email);
     }
 
     // ==================== GROUP MANAGEMENT ====================
@@ -291,445 +187,163 @@ public class AdminModel {
      * Requests all groups from server
      */
     public void requestAllGroups() {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String requestXML = createRequestXML("admin_getgroups");
-        sendMessage(requestXML);
-        logMessage("Requested groups list");
+        String requestXML = xmlBuilder.createRequestMessage("admin_getgroups");
+        networkManager.sendMessage(requestXML);
+        addLogEntry("Requested groups list");
     }
 
     /**
      * Deletes a group
      */
     public void deleteGroup(String groupId) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
-        }
+        if (!validateAuthentication()) return;
 
-        String deleteXML = createDeleteGroupXML(groupId);
-        sendMessage(deleteXML);
-        logMessage("Deleting group: " + groupId);
+        String deleteXML = xmlBuilder.createDeleteGroupMessage(groupId);
+        networkManager.sendMessage(deleteXML);
+        addLogEntry("Deleting group: " + groupId);
     }
 
     /**
      * Gets group members
      */
     public void getGroupMembers(String groupId) {
-        if (!authenticated) {
-            notifyError("Not authenticated");
-            return;
+        if (!validateAuthentication()) return;
+
+        String requestXML = xmlBuilder.createGetGroupMembersMessage(groupId);
+        networkManager.sendMessage(requestXML);
+        addLogEntry("Requested members for group: " + groupId);
+    }
+
+    // ==================== NETWORK LISTENER IMPLEMENTATION ====================
+
+    @Override
+    public void onConnectionStatusChanged(boolean connected) {
+        if (!connected && session.isAuthenticated()) {
+            session.clearSession();
         }
-
-        String requestXML = createGetGroupMembersXML(groupId);
-        sendMessage(requestXML);
-        logMessage("Requested members for group: " + groupId);
+        notifyConnectionStatusChanged(connected);
     }
 
-    // ==================== MESSAGE HANDLING ====================
-
-    /**
-     * Starts the message receiver thread
-     */
-    private void startMessageReceiver() {
-        messageReceiverThread = new Thread(() -> {
-            logMessage("Message receiver thread started");
-
-            while (receiving && connected && !Thread.currentThread().isInterrupted()) {
-                try {
-                    if (in == null) break;
-
-                    String message = in.readLine();
-                    if (message != null) {
-                        logMessage("Received: " + message);
-                        processMessage(message);
-                    } else {
-                        // Connection closed by server
-                        logMessage("Server closed connection");
-                        break;
-                    }
-                } catch (SocketTimeoutException e) {
-                    // Timeout is okay, continue
-                    continue;
-                } catch (IOException e) {
-                    if (receiving && connected) {
-                        logMessage("Error receiving message: " + e.getMessage());
-                        System.err.println("[ERROR] Error receiving message: " + e.getMessage());
-                    }
-                    break;
-                }
-            }
-
-            // Connection lost
-            if (connected) {
-                connected = false;
-                notifyConnectionStatusChanged(false);
-                logMessage("Message receiver thread terminated - connection lost");
-            }
-        });
-
-        messageReceiverThread.setDaemon(true);
-        messageReceiverThread.setName("AdminMessageReceiver");
-        messageReceiverThread.start();
+    @Override
+    public void onMessageReceived(String xmlMessage) {
+        messageProcessor.processMessage(xmlMessage);
     }
 
-    /**
-     * Processes received XML messages
-     */
-    private void processMessage(String xmlMessage) {
-        try {
-            if (xmlMessage == null || xmlMessage.trim().isEmpty()) {
-                return;
-            }
-
-            DocumentBuilderFactory dbFactory = DocumentBuilderFactory.newInstance();
-            DocumentBuilder dBuilder = dbFactory.newDocumentBuilder();
-            Document doc = dBuilder.parse(new InputSource(new StringReader(xmlMessage)));
-            doc.getDocumentElement().normalize();
-
-            Element root = doc.getDocumentElement();
-            String messageType = root.getTagName();
-
-            logMessage("Processing message type: " + messageType);
-
-            if ("response".equals(messageType)) {
-                String responseType = root.getAttribute("type");
-                handleResponse(responseType, doc);
-            } else if ("message".equals(messageType)) {
-                String msgType = root.getAttribute("type");
-                handleMessage(msgType, doc);
-            } else {
-                logMessage("Unknown message format: " + messageType);
-            }
-
-        } catch (Exception e) {
-            logMessage("Error processing message: " + e.getMessage());
-            System.err.println("[ERROR] Error processing XML: " + xmlMessage);
-            e.printStackTrace();
-        }
-    }
+    // ==================== MESSAGE PROCESSOR CALLBACKS ====================
 
     /**
-     * Handles response messages
+     * Called by MessageProcessor when login response is received
      */
-    private void handleResponse(String responseType, Document doc) {
-        logMessage("Handling response type: " + responseType);
-
-        switch (responseType) {
-            case "login":
-                handleLoginResponse(doc);
-                break;
-
-            case "adminUsers":
-                handleUsersResponse(doc);
-                break;
-
-            case "adminGroups":
-                handleGroupsResponse(doc);
-                break;
-
-            case "groupMembers":
-                handleGroupMembersResponse(doc);
-                break;
-
-            case "general":
-                handleGeneralResponse(doc);
-                break;
-
-            default:
-                logMessage("Unknown response type: " + responseType);
-        }
-    }
-
-    /**
-     * Handles message notifications
-     */
-    private void handleMessage(String messageType, Document doc) {
-        switch (messageType) {
-            case "error":
-                handleErrorMessage(doc);
-                break;
-
-            case "forceLogout":
-                handleForceLogout(doc);
-                break;
-
-            default:
-                logMessage("Unknown message type: " + messageType);
-        }
-    }
-
-    /**
-     * Handles login response
-     */
-    private void handleLoginResponse(Document doc) {
-        try {
-            String successStr = getElementValue(doc, "success");
-            boolean success = Boolean.parseBoolean(successStr);
-
-            logMessage("Login response - success: " + success);
-
-            if (success) {
-                sessionId = getElementValue(doc, "sessionId");
-                adminName = getElementValue(doc, "userName");
-                String isAdminStr = getElementValue(doc, "isAdmin");
-                boolean isAdmin = Boolean.parseBoolean(isAdminStr);
-
-                logMessage("Session ID: " + sessionId + ", Admin Name: " + adminName + ", Is Admin: " + isAdmin);
-
-                if (isAdmin) {
-                    authenticated = true;
-                    notifyLoginResult(true, "Login successful");
-                    logMessage("Successfully authenticated as admin: " + adminEmail);
-                } else {
-                    notifyLoginResult(false, "Access denied: Admin privileges required");
-                    logMessage("Login failed: Not an admin user");
-                    disconnect();
-                }
-            } else {
-                String errorMsg = getElementValue(doc, "message");
-                if (errorMsg.isEmpty()) {
-                    errorMsg = "Invalid credentials";
-                }
-                notifyLoginResult(false, errorMsg);
-                logMessage("Login failed: " + errorMsg);
-            }
-        } catch (Exception e) {
-            logMessage("Error handling login response: " + e.getMessage());
-            notifyLoginResult(false, "Error processing login response");
-        }
-    }
-
-    /**
-     * Handles users list response
-     */
-    private void handleUsersResponse(Document doc) {
-        usersList.clear();
-        NodeList userNodes = doc.getElementsByTagName("user");
-
-        for (int i = 0; i < userNodes.getLength(); i++) {
-            Element userElement = (Element) userNodes.item(i);
-            Map<String, String> user = new HashMap<>();
-            user.put("email", getElementValue(userElement, "email"));
-            user.put("name", getElementValue(userElement, "name"));
-            user.put("isAdmin", getElementValue(userElement, "isAdmin"));
-            user.put("created", getElementValue(userElement, "created"));
-            usersList.add(user);
-        }
-
-        notifyUsersDataReceived(new ArrayList<>(usersList));
-        logMessage("Received " + usersList.size() + " users");
-    }
-
-    /**
-     * Handles groups list response
-     */
-    private void handleGroupsResponse(Document doc) {
-        groupsList.clear();
-        NodeList groupNodes = doc.getElementsByTagName("group");
-
-        for (int i = 0; i < groupNodes.getLength(); i++) {
-            Element groupElement = (Element) groupNodes.item(i);
-            Map<String, String> group = new HashMap<>();
-            group.put("id", getElementValue(groupElement, "id"));
-            group.put("name", getElementValue(groupElement, "name"));
-            group.put("creator", getElementValue(groupElement, "creator"));
-            group.put("memberCount", getElementValue(groupElement, "memberCount"));
-            group.put("created", getElementValue(groupElement, "created"));
-            groupsList.add(group);
-        }
-
-        notifyGroupsDataReceived(new ArrayList<>(groupsList));
-        logMessage("Received " + groupsList.size() + " groups");
-    }
-
-    /**
-     * Handles group members response
-     */
-    private void handleGroupMembersResponse(Document doc) {
-        String groupId = getElementValue(doc, "groupId");
-        NodeList memberNodes = doc.getElementsByTagName("member");
-
-        StringBuilder members = new StringBuilder("Group " + groupId + " Members:\n");
-        for (int i = 0; i < memberNodes.getLength(); i++) {
-            members.append("- ").append(memberNodes.item(i).getTextContent()).append("\n");
-        }
-
-        notifyMessage(members.toString());
-        logMessage("Received members for group: " + groupId);
-    }
-
-    /**
-     * Handles general response
-     */
-    private void handleGeneralResponse(Document doc) {
-        String successStr = getElementValue(doc, "success");
-        boolean success = Boolean.parseBoolean(successStr);
-        String message = getElementValue(doc, "message");
-
-        notifyOperationResult(success, message);
-        logMessage("Operation result: " + message);
-    }
-
-    /**
-     * Handles error messages
-     */
-    private void handleErrorMessage(Document doc) {
-        String error = getElementValue(doc, "error");
-        if (error.isEmpty()) {
-            error = getElementValue(doc, "message");
-        }
-        notifyError(error);
-        logMessage("Error received: " + error);
-    }
-
-    /**
-     * Handles force logout
-     */
-    private void handleForceLogout(Document doc) {
-        String reason = getElementValue(doc, "reason");
-        authenticated = false;
-        notifyError("Forced logout: " + reason);
-        logMessage("Forced logout: " + reason);
-        disconnect();
-    }
-
-    /**
-     * Sends a message to the server
-     */
-    private void sendMessage(String message) {
-        if (out != null && connected) {
-            try {
-                logMessage("Sending: " + message);
-                out.println(message);
-                out.flush();
-            } catch (Exception e) {
-                logMessage("Error sending message: " + e.getMessage());
-                connected = false;
-                notifyConnectionStatusChanged(false);
-            }
+    public void handleLoginResult(boolean success, String message, String sessionId, String adminName, boolean isAdmin) {
+        if (success && isAdmin) {
+            session.setAuthenticationData(sessionId, adminName, true);
+            notifyLoginResult(true, "Login successful");
+            addLogEntry("Successfully authenticated as admin: " + session.getAdminEmail());
+        } else if (success && !isAdmin) {
+            notifyLoginResult(false, "Access denied: Admin privileges required");
+            addLogEntry("Login failed: Not an admin user");
+            networkManager.disconnect();
         } else {
-            logMessage("Cannot send message - not connected");
+            notifyLoginResult(false, message);
+            addLogEntry("Login failed: " + message);
         }
     }
 
     /**
-     * Sends logout message
+     * Called by MessageProcessor when users data is received
      */
-    private void sendLogoutMessage() {
-        String logoutXML = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"logout\"/>";
-        sendMessage(logoutXML);
-    }
-
-    // ==================== XML CREATION METHODS ====================
-
-    private String createLoginXML(String email, String password) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"login\">" +
-                "<email><![CDATA[" + email + "]]></email>" +
-                "<password><![CDATA[" + password + "]]></password>" +
-                "</message>";
-    }
-
-    private String createRequestXML(String requestType) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"" + requestType + "\"/>";
-    }
-
-    private String createSearchUsersXML(String searchKey) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"admin_searchusers\">" +
-                "<searchKey><![CDATA[" + searchKey + "]]></searchKey>" +
-                "</message>";
-    }
-
-    private String createAddUserXML(String email, String password, String name, boolean isAdmin) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"admin_adduser\">" +
-                "<email><![CDATA[" + email + "]]></email>" +
-                "<password><![CDATA[" + password + "]]></password>" +
-                "<name><![CDATA[" + name + "]]></name>" +
-                "<isAdmin>" + isAdmin + "</isAdmin>" +
-                "</message>";
-    }
-
-    private String createUpdateUserXML(String email, String newName, String newPassword) {
-        StringBuilder xml = new StringBuilder();
-        xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-        xml.append("<message type=\"admin_updateuser\">");
-        xml.append("<email><![CDATA[").append(email).append("]]></email>");
-        if (newName != null && !newName.trim().isEmpty()) {
-            xml.append("<name><![CDATA[").append(newName.trim()).append("]]></name>");
-        }
-        if (newPassword != null && !newPassword.trim().isEmpty()) {
-            xml.append("<password><![CDATA[").append(newPassword).append("]]></password>");
-        }
-        xml.append("</message>");
-        return xml.toString();
-    }
-
-    private String createDeleteUserXML(String email) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"admin_deleteuser\">" +
-                "<email><![CDATA[" + email + "]]></email>" +
-                "</message>";
-    }
-
-    private String createDeleteGroupXML(String groupId) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"admin_deletegroup\">" +
-                "<groupId><![CDATA[" + groupId + "]]></groupId>" +
-                "</message>";
-    }
-
-    private String createGetGroupMembersXML(String groupId) {
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
-                "<message type=\"admin_getgroupmembers\">" +
-                "<groupId><![CDATA[" + groupId + "]]></groupId>" +
-                "</message>";
-    }
-
-    // ==================== UTILITY METHODS ====================
-
-    /**
-     * Gets element value from XML document
-     */
-    private String getElementValue(Document doc, String tagName) {
-        NodeList nodeList = doc.getElementsByTagName(tagName);
-        if (nodeList.getLength() > 0) {
-            Node node = nodeList.item(0);
-            return node.getTextContent() != null ? node.getTextContent().trim() : "";
-        }
-        return "";
+    public void handleUsersData(List<Map<String, String>> users) {
+        notifyUsersDataReceived(users);
+        addLogEntry("Received " + users.size() + " users");
     }
 
     /**
-     * Gets element value from parent element
+     * Called by MessageProcessor when groups data is received
      */
-    private String getElementValue(Element parent, String tagName) {
-        NodeList nodeList = parent.getElementsByTagName(tagName);
-        if (nodeList.getLength() > 0) {
-            Node node = nodeList.item(0);
-            return node.getTextContent() != null ? node.getTextContent().trim() : "";
-        }
-        return "";
+    public void handleGroupsData(List<Map<String, String>> groups) {
+        notifyGroupsDataReceived(groups);
+        addLogEntry("Received " + groups.size() + " groups");
     }
 
     /**
-     * Logs a message with timestamp
+     * Called by MessageProcessor when group members are received
      */
-    private void logMessage(String message) {
-        String timestamp = new java.text.SimpleDateFormat("HH:mm:ss").format(new Date());
-        String logEntry = "[" + timestamp + "] " + message;
-        messageLog.add(logEntry);
-        System.out.println(logEntry); // Also print to console for debugging
+    public void handleGroupMembers(String groupId, List<String> members) {
+        StringBuilder membersText = new StringBuilder("Group " + groupId + " Members:\n");
+        for (String member : members) {
+            membersText.append("- ").append(member).append("\n");
+        }
+        notifyMessage(membersText.toString());
+        addLogEntry("Received members for group: " + groupId);
+    }
 
-        // Notify listeners
+    /**
+     * Called by MessageProcessor when operation result is received
+     */
+    public void handleOperationResult(boolean success, String message) {
+        notifyOperationResult(success, message);
+        addLogEntry("Operation result: " + message);
+    }
+
+    /**
+     * Called by MessageProcessor when error is received
+     */
+    public void handleError(String error) {
+        notifyError(error);
+        addLogEntry("Error received: " + error);
+    }
+
+    /**
+     * Called by MessageProcessor when force logout occurs
+     */
+    public void handleForceLogout(String reason) {
+        session.clearSession();
+        notifyError("Forced logout: " + reason);
+        addLogEntry("Forced logout: " + reason);
+        networkManager.disconnect();
+    }
+
+    // ==================== VALIDATION METHODS ====================
+
+    /**
+     * Validates login input
+     */
+    private boolean validateLoginInput(String email, String password) {
+        if (email == null || email.trim().isEmpty()) {
+            notifyLoginResult(false, "Email cannot be empty");
+            return false;
+        }
+
+        if (password == null || password.trim().isEmpty()) {
+            notifyLoginResult(false, "Password cannot be empty");
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Validates authentication for operations
+     */
+    private boolean validateAuthentication() {
+        if (!session.isAuthenticated()) {
+            notifyError("Not authenticated");
+            return false;
+        }
+        return true;
+    }
+
+    // ==================== LOGGING ====================
+
+    /**
+     * Adds a log entry with timestamp
+     */
+    private void addLogEntry(String message) {
+        String logEntry = dataCache.addLogEntry(message);
         notifyMessage(logEntry);
+        System.out.println(logEntry); // Also print to console for debugging
     }
 
     // ==================== LISTENER MANAGEMENT ====================
@@ -815,26 +429,26 @@ public class AdminModel {
     // ==================== GETTERS ====================
 
     public String getAdminEmail() {
-        return adminEmail;
+        return session.getAdminEmail();
     }
 
     public String getAdminName() {
-        return adminName;
+        return session.getAdminName();
     }
 
     public String getSessionId() {
-        return sessionId;
+        return session.getSessionId();
     }
 
     public List<Map<String, String>> getUsersList() {
-        return new ArrayList<>(usersList);
+        return dataCache.getUsersList();
     }
 
     public List<Map<String, String>> getGroupsList() {
-        return new ArrayList<>(groupsList);
+        return dataCache.getGroupsList();
     }
 
     public List<String> getMessageLog() {
-        return new ArrayList<>(messageLog);
+        return dataCache.getMessageLog();
     }
 }
